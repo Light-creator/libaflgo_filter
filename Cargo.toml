@@ -4,6 +4,7 @@ members = [
     "libaflgo",
     "wrapper/libafl_cc_libs",
     "fuzzers/aflgo",
+    "fuzzers/aflgo_ml",
     "fuzzers/hawkeye",
     "fuzzers/dafl",
 ]

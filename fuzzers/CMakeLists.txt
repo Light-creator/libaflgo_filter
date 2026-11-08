@@ -1,4 +1,4 @@
-set(FUZZERS aflgo hawkeye dafl)
+set(FUZZERS aflgo hawkeye dafl aflgo_ml)
 
 foreach(FUZZER ${FUZZERS})
   # Reset feature flags

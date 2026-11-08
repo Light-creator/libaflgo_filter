@@ -31,6 +31,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aflgo_ml"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libafl",
+ "libafl_targets",
+ "libaflgo",
+ "libaflgo_targets",
+ "mimalloc",
+ "nix",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
