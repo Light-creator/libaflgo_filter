@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 pub mod dafl;
 pub use dafl::{DAFLFeedback, DAFLObserver, DAFLPowerMutationalStage, DAFLWeightedScheduler};
 
-// Fileter 
+// Filter 
 pub mod filter;
 pub mod input_filter;
+pub mod png_features;
+pub mod ml_filter;
 
 pub trait DistanceObserver<S>: Observer<S>
 where

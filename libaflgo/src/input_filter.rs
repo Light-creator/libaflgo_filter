@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 
+use crate::png_features::PngFeatures;
+
 use libafl::{
     corpus::{CorpusId},
     fuzzer::ExecuteInputResult,
@@ -14,7 +16,8 @@ pub struct MutantFeatures {
     pub iter_id: u64,
     pub iter_count: u64,
     pub mut_sz: usize,
-    pub parent_dist: f64
+    pub parent_dist: f64,
+    pub png: PngFeatures
 }
 
 // Фильтр получает эти признаки после запуска и дообучает модель

@@ -52,7 +52,7 @@ use libafl_targets::{
 
 use libaflgo::{CoolingSchedule, DistanceFeedback};
 use libaflgo::filter::{FilterDistancePowerMutationalStage};
-use libaflgo::input_filter::RandomDrop;
+use libaflgo::ml_filter::MlFilter;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
 
 /// LibAFL-based in-process reimplementation of AFLGo
@@ -326,7 +326,7 @@ fn fuzz<P: AsRef<Path>>(
     )?;
     
     // TODO change to our realisation
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, Box::new(RandomDrop::new(0.5, 1337)))?;
+    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, Box::new(MlFilter::new(1000)))?;
 
     // A minimization+queue policy to get testcasess from the corpus
     let scheduler = IndexesLenTimeMinimizerScheduler::new(StdWeightedScheduler::with_schedule(

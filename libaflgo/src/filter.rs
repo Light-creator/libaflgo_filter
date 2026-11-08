@@ -4,6 +4,7 @@ use std::{fs::File, io::{BufWriter, Write}};
 use crate::DistancePowerTestcaseScore;
 use crate::DistanceObserver;
 use crate::DistanceTestcaseMetadata;
+use crate::png_features::{extract_png_features};
 
 use crate::input_filter::{FilterTrait, MutantFeatures, MutantOutcome, Decision};
 
@@ -112,20 +113,34 @@ where
             // Считаем размер мутанта
             let mut_sz = untransformed.target_bytes().as_slice().len();
 
+            // Извлекаем признаки png
+            let png = extract_png_features(
+                untransformed.target_bytes().as_slice(),
+            );
+
             // MutantFeatures для принятия решение о запуске
             let mut_features = MutantFeatures{
                 id: corpus_idx,
                 iter_id: i,
                 iter_count: num,
                 mut_sz: mut_sz,
-                parent_dist: parent_dist
+                parent_dist: parent_dist,
+                png: png
             };
+
+            let png_ref = &mut_features.png;
 
             let filter_res = self.filter.make_decision(&mut_features);
 
             if filter_res == Decision::Discard {
-                writeln!(self.buff, "{},{},{},{},{},,,,{:?}", 
-                    corpus_idx, i, num, mut_sz, parent_dist, filter_res)?;
+                writeln!(self.buff, "{},{},{},{},{},,,,{:?},{},{},{},{},{}", 
+                    corpus_idx, i, num, mut_sz, parent_dist, filter_res,
+                    png_ref.valid_signature, 
+                    png_ref.width.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.height.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.bit_depth.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.color_type.map(|v| v.to_string()).unwrap_or_default()
+                )?;
 
                 self.mutator_mut().post_exec(state, i as i32, None)?;
                 post.post_exec(state, i as i32, None)?;
@@ -162,8 +177,15 @@ where
             self.filter.make_observation(&mut_features, &mut_outcome);
 
             // id, iter_id, iter_count, mut_sz, parent_dist, eval_result, mut_dist, target, decision
-            writeln!(self.buff, "{},{},{},{},{},{:?},{},{},{:?}", 
-                corpus_idx, i, num, mut_sz, parent_dist, mut_outcome.eval_result, mut_dist, target, filter_res)?;
+            writeln!(self.buff, "{},{},{},{},{},{:?},{},{},{:?},{},{},{},{},{}", 
+                corpus_idx, i, num, mut_sz, parent_dist, 
+                mut_outcome.eval_result, mut_dist, target, filter_res,
+                    png_ref.valid_signature, 
+                    png_ref.width.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.height.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.bit_depth.map(|v| v.to_string()).unwrap_or_default(), 
+                    png_ref.color_type.map(|v| v.to_string()).unwrap_or_default()
+                )?;
 
             self.mutator_mut().post_exec(state, i as i32, new_idx)?;
             post.post_exec(state, i as i32, new_idx)?;
@@ -219,6 +241,7 @@ where
     }
 }
 
+
 impl<E, F, EM, I, M, Z, O1, O2> FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2>
 where
     E: Executor<EM, Z> + HasObservers,
@@ -233,7 +256,7 @@ where
     /// Creates a new transforming [`FilterPwerMutationalStage`]
     pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
         let mut out = BufWriter::new(File::create("data.csv")?);
-        writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision")?;
+        writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,valid_signature,width,height,bit_depth,color_type")?;
         
         Ok(Self {
             mutator,
