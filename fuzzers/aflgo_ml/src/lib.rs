@@ -326,7 +326,21 @@ fn fuzz<P: AsRef<Path>>(
     )?;
     
     // TODO change to our realisation
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, Box::new(MlFilter::new(1000)))?;
+    //
+    
+    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so");
+
+    let ml_filter = match ml_filter_res {
+        Ok(res) => res,
+        Err(err) => {
+            return Err(Error::illegal_argument(format!(
+                "Failed to load ML model library: {err}"
+            )));
+        },
+    };
+
+    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, Box::new(ml_filter))?;
+
 
     // A minimization+queue policy to get testcasess from the corpus
     let scheduler = IndexesLenTimeMinimizerScheduler::new(StdWeightedScheduler::with_schedule(
