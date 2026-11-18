@@ -25,7 +25,9 @@ pub struct MutantFeatures {
 pub struct MutantOutcome {
     pub eval_result: ExecuteInputResult,
     pub mut_dist: f64,
-    pub target: u64   
+    pub target: u64,
+    pub reached_targets: Vec<usize>,
+    pub reached_intermediates: Vec<usize>
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

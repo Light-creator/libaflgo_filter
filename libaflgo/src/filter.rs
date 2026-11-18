@@ -25,24 +25,25 @@ use libafl::{
 
 /// The mutational stage using power schedules
 #[derive(Debug)]
-pub struct FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2> {
+pub struct FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3> {
     mutator: M,
     #[allow(clippy::type_complexity)]
-    phantom: PhantomData<(E, F, EM, I, Z, O1, O2)>,
+    phantom: PhantomData<(E, F, EM, I, Z, O1, O2, O3)>,
     buff: BufWriter<File>,
     dist_name: String,
     targets_name: String,
+    intermediate_name: String,
     filter: Box<dyn FilterTrait>
 }
 
-impl<E, F, EM, I, M, Z, O1, O2> UsesState for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2>
+impl<E, F, EM, I, M, Z, O1, O2, O3> UsesState for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
 where
     E: UsesState,
 {
     type State = E::State;
 }
 
-impl<E, F, EM, I, M, Z, O1, O2> MutationalStage<E, EM, I, M, Z> for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2>
+impl<E, F, EM, I, M, Z, O1, O2, O3> MutationalStage<E, EM, I, M, Z> for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
 where
     E: Executor<EM, Z> + HasObservers,
     EM: UsesState<State = E::State>,
@@ -54,6 +55,7 @@ where
     E::Input: HasTargetBytes,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
+    O3: MapObserver,
 {
     /// The mutator, added to this stage
     #[inline]
@@ -150,7 +152,7 @@ where
 
             let (eval_result, new_idx) = fuzzer.evaluate_input(state, executor, manager, untransformed)?;
 
-            // TODO: Делаем сбор данных    
+            // Сбор данных
             
             // Находим обсерверы и достаем их них информацию о расстоянии и достижении цели
             let observers = executor.observers();
@@ -162,8 +164,32 @@ where
             let targets_observer = observers.match_name::<O2>(&self.targets_name).ok_or_else(|| {
                 libafl::Error::key_not_found("MapObserver not found".to_string())
             })?;
-            
-            
+
+            let intermediate_observer = observers.match_name::<O3>(&self.intermediate_name).ok_or_else(|| {
+                libafl::Error::key_not_found("IntermediateObserver not found".to_string())
+            })?;
+
+
+            let initial = targets_observer.initial();
+
+            let mut reached_targets: Vec<usize> = vec![];
+            for index in 0..targets_observer.usable_count() {
+                let value = *targets_observer.get(index);
+
+                if value != initial {
+                    reached_targets.push(index);
+                }
+            }
+
+            let mut reached_intermediates: Vec<usize> = vec![];
+            for index in 0..intermediate_observer.usable_count() {
+                let value = *intermediate_observer.get(index);
+
+                if value != intermediate_observer.initial() {
+                    reached_intermediates.push(index);
+                }
+            }
+
             let mut_dist = dist_observer.distance();
             let target = targets_observer.count_bytes();
 
@@ -171,7 +197,9 @@ where
             let mut_outcome = MutantOutcome{
                 eval_result: eval_result,
                 mut_dist: mut_dist,
-                target: target  
+                target: target,
+                reached_targets,
+                reached_intermediates
             };
 
             self.filter.make_observation(&mut_features, &mut_outcome);
@@ -196,7 +224,7 @@ where
     }
 }
 
-impl<E, F, EM, I, M, Z, O1, O2> Stage<E, EM, Z> for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2>
+impl<E, F, EM, I, M, Z, O1, O2, O3> Stage<E, EM, Z> for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
 where
     E: Executor<EM, Z> + HasObservers,
     EM: UsesState<State = E::State>,
@@ -208,6 +236,7 @@ where
     E::Input: HasTargetBytes,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
+    O3: MapObserver,
 {
     #[inline]
     #[allow(clippy::let_and_return)]
@@ -224,7 +253,7 @@ where
     }
 }
 
-impl<E, F, EM, M, Z, O1, O2> FilterPowerMutationalStage<E, F, EM, E::Input, M, Z, O1, O2>
+impl<E, F, EM, M, Z, O1, O2, O3> FilterPowerMutationalStage<E, F, EM, E::Input, M, Z, O1, O2, O3>
 where
     E: Executor<EM, Z> + HasObservers,
     EM: UsesState<State = E::State>,
@@ -234,15 +263,16 @@ where
     Z: Evaluator<E, EM, State = E::State>,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
+    O3: MapObserver,
 {
     /// Creates a new [`FilterPowerMutationalStage`]
-    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
-        Self::transforming(mutator, dist_observer, targets_observer, filter)
+    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
+        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter)
     }
 }
 
 
-impl<E, F, EM, I, M, Z, O1, O2> FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2>
+impl<E, F, EM, I, M, Z, O1, O2, O3> FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
 where
     E: Executor<EM, Z> + HasObservers,
     EM: UsesState<State = E::State>,
@@ -252,9 +282,10 @@ where
     Z: Evaluator<E, EM, State = E::State>,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
+    O3: MapObserver,
 {
     /// Creates a new transforming [`FilterPwerMutationalStage`]
-    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
+    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
         let mut out = BufWriter::new(File::create("data.csv")?);
         writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,valid_signature,width,height,bit_depth,color_type")?;
         
@@ -264,12 +295,13 @@ where
             buff: out,
             dist_name: dist_observer.name().to_string(),
             targets_name: targets_observer.name().to_string(),
+            intermediate_name: intermediate_observer.name().to_string(),
             filter
         })
     }
 }
 
-pub type FilterDistancePowerMutationalStage<E, EM, I, M, Z, O1, O2> =
-    FilterPowerMutationalStage<E, DistancePowerTestcaseScore, EM, I, M, Z, O1, O2>;
+pub type FilterDistancePowerMutationalStage<E, EM, I, M, Z, O1, O2, O3> =
+    FilterPowerMutationalStage<E, DistancePowerTestcaseScore, EM, I, M, Z, O1, O2, O3>;
 
 

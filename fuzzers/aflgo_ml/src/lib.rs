@@ -54,6 +54,7 @@ use libaflgo::{CoolingSchedule, DistanceFeedback};
 use libaflgo::filter::{FilterDistancePowerMutationalStage};
 use libaflgo::ml_filter::MlFilter;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
+use libaflgo_targets::intermediate::get_intermediate_map_observer;
 
 /// LibAFL-based in-process reimplementation of AFLGo
 #[derive(Parser, Debug)]
@@ -259,6 +260,8 @@ fn fuzz<P: AsRef<Path>>(
     let targets_observer =
         HitcountsMapObserver::new(unsafe { get_targets_map_observer("targets") });
 
+    let intermediate_observer = unsafe { get_intermediate_map_observer("intermediate") };
+
     let cmplog_observer = CmpLogObserver::new("cmplog", true);
 
     let map_feedback = MaxMapFeedback::tracking(&edges_observer, true, false);
@@ -328,7 +331,7 @@ fn fuzz<P: AsRef<Path>>(
     // TODO change to our realisation
     //
     
-    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so");
+    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so", 1337);
 
     let ml_filter = match ml_filter_res {
         Ok(res) => res,
@@ -339,7 +342,7 @@ fn fuzz<P: AsRef<Path>>(
         },
     };
 
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, Box::new(ml_filter))?;
+    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter))?;
 
 
     // A minimization+queue policy to get testcasess from the corpus
@@ -370,7 +373,8 @@ fn fuzz<P: AsRef<Path>>(
                 edges_observer,
                 time_observer,
                 distance_observer,
-                targets_observer
+                targets_observer,
+                intermediate_observer
             ),
             &mut fuzzer,
             &mut state,

@@ -3,6 +3,7 @@
 #include <AFLGoLinker/DuplicateTargetRemoval.hpp>
 #include <AFLGoLinker/FunctionDistanceInstrumentation.hpp>
 #include <AFLGoLinker/TargetInjectionFixup.hpp>
+#include <AFLGoLinker/IntermediateInjectionFixup.hpp>
 
 #include <Analysis/BasicBlockDistance.hpp>
 #include <Analysis/DAFL.hpp>
@@ -79,6 +80,7 @@ static void addPasses(ModulePassManager &MPM) {
   MPM.addPass(ModuleSanitizerCoveragePass(Options));
 
   MPM.addPass(AFLGoTargetInjectionFixupPass());
+  MPM.addPass(AFLGoIntermediateInjectionFixupPass()); 
 }
 
 llvm::PassPluginLibraryInfo getAFLGoLinkerPluginInfo() {

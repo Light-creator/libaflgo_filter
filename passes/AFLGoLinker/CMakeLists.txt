@@ -5,6 +5,7 @@ add_llvm_library(
   DistanceInstrumentation.cpp
   DuplicateTargetRemoval.cpp
   TargetInjectionFixup.cpp
+  IntermediateInjectionFixup.cpp
   FunctionDistanceInstrumentation.cpp
   Plugin.cpp)
 target_compile_definitions(${AFLGO_LINKER_PLUGIN_NAME}
