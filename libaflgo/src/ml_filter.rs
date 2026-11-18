@@ -1,11 +1,15 @@
 
 use crate::input_filter::{MutantFeatures, MutantOutcome, FilterTrait, Decision};
 use libafl::bolts::rands::{Rand, StdRand};
+use std::fs::File;
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader};
 
 #[derive(Debug)]
 pub struct TrainingSample {
     pub features: MutantFeatures,
-    pub reached: bool
+    pub reached_intermediates: Vec<usize>,
+    pub reached_final: bool
 }
 
 #[derive(Debug, PartialEq)]
@@ -14,6 +18,11 @@ pub enum FilterPhase {
     Collecting
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LearningTarget {
+    Intermediate(usize),
+    Final,
+}
 
 #[derive(Debug)]
 pub struct MlFilter {
@@ -29,6 +38,9 @@ pub struct MlFilter {
     executed: u64,
     discarded: u64,
     explored: u64,
+    intermediate_hits: [usize; 256],
+    learning_target: LearningTarget,
+    intermediate_chain: Vec<usize>
 }
 
 pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
@@ -50,8 +62,11 @@ pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
 } 
 
 impl MlFilter {
-    pub fn new(max_samples: usize, path: &str, seed: u64) -> Result<Self, libloading::Error> {
+    pub fn new(max_samples: usize, path: &str, seed: u64, node_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let library = unsafe { libloading::Library::new(path) }?;
+    
+        let intermediate_chain = Self::read_target_csv(node_path)?;
+        println!("intermediate_chain: {:?}", intermediate_chain);
 
         Ok(Self {
             samples: Vec::new(),
@@ -66,6 +81,9 @@ impl MlFilter {
             executed: 0,
             discarded: 0,
             explored: 0,
+            intermediate_hits: [0; 256],
+            learning_target: LearningTarget::Final,
+            intermediate_chain
         })
     }
 
@@ -90,7 +108,7 @@ impl MlFilter {
         let mut labels: Vec<f32> = vec![];
         for sample in self.samples.iter() {
             features.extend_from_slice(&prep_mutant_features(&sample.features));
-            if sample.reached { 
+            if self.reached_learning_target(sample) { 
                 labels.push(1.0); 
             } else {
                 labels.push(0.0);
@@ -104,6 +122,91 @@ impl MlFilter {
 
         Ok(train_res)
     }
+
+    fn reached_learning_target(&self, sample: &TrainingSample) -> bool {
+        match self.learning_target {
+            LearningTarget::Intermediate(id) => sample.reached_intermediates.contains(&id),
+            LearningTarget::Final => sample.reached_final,
+        }
+    }
+
+    fn read_target_csv(path: &str) -> io::Result<Vec<usize>> {
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+        let mut lines = BufReader::new(File::open(path)?).lines();
+        let header = lines.next().transpose()?.ok_or_else(|| {
+            invalid("Missing intermediate-node CSV header".to_string())
+        })?;
+        if header != "target_id,node_id,depth,function,block" {
+            return Err(invalid("Unexpected intermediate-node CSV header".to_string()));
+        }
+
+        let mut target = None;
+        let mut nodes = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_depths = HashSet::new();
+        for (index, line) in lines.enumerate() {
+            let line = line?;
+            let line_number = index + 2;
+            let mut parts = line.splitn(4, ',');
+            let mut read_number = |field: &str| -> io::Result<usize> {
+                let value = parts.next().ok_or_else(|| {
+                    invalid(format!("Line {line_number}: missing {field}"))
+                })?;
+                value.parse().map_err(|_| {
+                    invalid(format!("Line {line_number}: invalid {field}"))
+                })
+            };
+            let target_id = read_number("target_id")?;
+            let node_id = read_number("node_id")?;
+            let depth = read_number("depth")?;
+            if parts.next().is_none() {
+                return Err(invalid(format!("Line {line_number}: missing node description")));
+            }
+            if let Some(expected) = target {
+                if target_id != expected {
+                    return Err(invalid(format!("Line {line_number}: multiple final targets are unsupported")));
+                }
+            } else {
+                target = Some(target_id);
+            }
+            if node_id >= 256 {
+                return Err(invalid(format!("Line {line_number}: node_id exceeds map capacity")));
+            }
+            if !seen_ids.insert(node_id) || !seen_depths.insert(depth) {
+                return Err(invalid(format!("Line {line_number}: duplicate node or depth")));
+            }
+            nodes.push((depth, node_id));
+        }
+        nodes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        Ok(nodes.into_iter().map(|(_, node_id)| node_id).collect())
+    }
+
+    fn select_learning_target(&self) -> Option<LearningTarget> {
+        let reached_final_count = self.samples.iter().filter(|sample| sample.reached_final).count();
+        if reached_final_count >= 50 && self.samples.len() - reached_final_count >= 50 {
+            return Some(LearningTarget::Final);
+        }
+
+        for intermediate_index in self.intermediate_chain.iter().rev() {
+            let reached_intermediates_count = self.samples.iter()
+                .filter(|sample| sample.reached_intermediates.contains(intermediate_index)).count();
+            if reached_intermediates_count >= 50 && self.samples.len() - reached_intermediates_count >= 50 {
+                return Some(LearningTarget::Intermediate(*intermediate_index));
+            }
+        }
+
+        None
+    }
+
+    fn model_reset(&self) -> Result<i32, libloading::Error> {
+        type ModelReset = unsafe extern "C" fn() -> i32;
+        let model_reset: libloading::Symbol<ModelReset> = unsafe { self.library.get(b"model_reset\0") }?;
+
+        let reset_res = unsafe { model_reset() };
+
+        Ok(reset_res)
+    }
+
 }
 
 
@@ -180,21 +283,71 @@ impl FilterTrait for MlFilter {
             return;
         }
 
+        for intermidiate in _outcome.reached_intermediates.iter() {
+            if *intermidiate < self.intermediate_hits.len() {
+                self.intermediate_hits[*intermidiate] += 1;
+            }
+        }
+
         if self.samples.len() < self.max_samples {
             let training_sample = TrainingSample{
                 features: _features.clone(),
-                reached: (_outcome.target > 0)
+                reached_intermediates: _outcome.reached_intermediates.clone(),
+                reached_final: _outcome.target > 0,
             };    
         
             self.samples.push(training_sample);
         
             if self.samples.len() == self.max_samples {
-                let positive = self.samples.iter().filter(|sample| sample.reached).count();
+                let learning_target = match self.select_learning_target() {
+                    Some(target) => target,
+                    None => {
+                        println!("Failed to get new learning_target");
+                        self.samples.clear();
+                        self.intermediate_hits.fill(0);
+                        return;
+                    }
+                };
+
+                if learning_target != self.learning_target {
+                    match self.model_reset() {
+                        Ok(0) => {
+                            println!("model_reset because of changing learning_target: {:?} -> {:?}",
+                                self.learning_target, learning_target);
+                            self.learning_target = learning_target;
+                        },
+                        Ok(code) => {
+                            println!("model_reset Error: code({})...", code);
+                            self.samples.clear();
+                            self.phase = FilterPhase::Collecting;
+                            self.intermediate_hits.fill(0);
+                            return;
+                        },
+                        Err(err) => {
+                            println!("model_reset Error: code({})...", err);
+                            self.samples.clear();
+                            self.phase = FilterPhase::Collecting;
+                            self.intermediate_hits.fill(0);
+                            return;
+                        }
+                    }
+                }
+
+                let positive = self.samples.iter().filter(|sample| self.reached_learning_target(sample)).count();
                 let negative = self.samples.len() - positive;
                 println!(
                     "Training samples: {} | positive: {} | negative: {}",
                     self.samples.len(), positive, negative
                 );
+                
+                for i in 0..self.intermediate_hits.len() {
+                    if self.intermediate_hits[i] != 0 {
+                        println!("Intermediate {}: {} / {}", i, self.intermediate_hits[i], self.samples.len());
+                    }
+                }
+
+                self.intermediate_hits.fill(0);
+
                 match self.train() {
                     Ok(0) => {
                         self.phase = FilterPhase::Filtering { decisions: 0 };

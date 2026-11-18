@@ -331,7 +331,8 @@ fn fuzz<P: AsRef<Path>>(
     // TODO change to our realisation
     //
     
-    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so", 1337);
+    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so", 
+        1337, "/home/light/Projects/fuzz_hybrid/test_libpng/aflgo_ml/intermediate_nodes.csv");
 
     let ml_filter = match ml_filter_res {
         Ok(res) => res,
