@@ -15,7 +15,8 @@ pub struct TrainingSample {
 #[derive(Debug, PartialEq)]
 pub enum FilterPhase {
     Filtering { decisions: usize },
-    Collecting
+    Collecting,
+    Calibrating { calibrations: usize }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,8 +40,17 @@ pub struct MlFilter {
     discarded: u64,
     explored: u64,
     intermediate_hits: [usize; 256],
-    learning_target: LearningTarget,
-    intermediate_chain: Vec<usize>
+    learning_target: Option<LearningTarget>,
+    intermediate_chain: Vec<usize>,
+    final_target_id: usize,
+    model_ready: bool,
+
+    last_decision: Option<Decision>,
+    target_execute: u64,
+    target_explore: u64,
+
+    calibrating_probs: Vec<Option<f32>>,
+    calibrating_labels: Vec<bool>,
 }
 
 pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
@@ -65,7 +75,7 @@ impl MlFilter {
     pub fn new(max_samples: usize, path: &str, seed: u64, node_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let library = unsafe { libloading::Library::new(path) }?;
     
-        let intermediate_chain = Self::read_target_csv(node_path)?;
+        let intermediate_chain = Self::read_target_csv(node_path, 0)?;
         println!("intermediate_chain: {:?}", intermediate_chain);
 
         Ok(Self {
@@ -82,8 +92,15 @@ impl MlFilter {
             discarded: 0,
             explored: 0,
             intermediate_hits: [0; 256],
-            learning_target: LearningTarget::Final,
-            intermediate_chain
+            learning_target: None,
+            intermediate_chain,
+            final_target_id: 0,
+            model_ready: false,
+            last_decision: None,
+            target_execute: 0,
+            target_explore: 0,
+            calibrating_probs: Vec::new(),
+            calibrating_labels: Vec::new()
         })
     }
 
@@ -100,6 +117,10 @@ impl MlFilter {
     }
 
     pub fn train(&self) -> Result<i32, libloading::Error> {
+        if self.learning_target.is_none() {
+            return Ok(-1);
+        }
+
         if self.samples.len() == 0 {
             return Ok(-1);
         }
@@ -125,12 +146,13 @@ impl MlFilter {
 
     fn reached_learning_target(&self, sample: &TrainingSample) -> bool {
         match self.learning_target {
-            LearningTarget::Intermediate(id) => sample.reached_intermediates.contains(&id),
-            LearningTarget::Final => sample.reached_final,
+            Some(LearningTarget::Intermediate(id)) => sample.reached_intermediates.contains(&id),
+            Some(LearningTarget::Final) => sample.reached_final,
+            None => false
         }
     }
 
-    fn read_target_csv(path: &str) -> io::Result<Vec<usize>> {
+    fn read_target_csv(path: &str, final_target_id: usize) -> io::Result<Vec<usize>> {
         let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
         let mut lines = BufReader::new(File::open(path)?).lines();
         let header = lines.next().transpose()?.ok_or_else(|| {
@@ -157,42 +179,85 @@ impl MlFilter {
                 })
             };
             let target_id = read_number("target_id")?;
+            
+            if target_id != final_target_id {
+               continue;
+            }
+
             let node_id = read_number("node_id")?;
             let depth = read_number("depth")?;
             if parts.next().is_none() {
                 return Err(invalid(format!("Line {line_number}: missing node description")));
             }
-            if let Some(expected) = target {
-                if target_id != expected {
-                    return Err(invalid(format!("Line {line_number}: multiple final targets are unsupported")));
-                }
-            } else {
-                target = Some(target_id);
-            }
+            
+            target = Some(target_id);
+            
+            // if let Some(expected) = target {
+            //     if target_id != expected {
+            //         return Err(invalid(format!("Line {line_number}: multiple final targets are unsupported")));
+            //     }
+            // } else {
+            //     target = Some(target_id);
+            // }
+
             if node_id >= 256 {
                 return Err(invalid(format!("Line {line_number}: node_id exceeds map capacity")));
             }
+
             if !seen_ids.insert(node_id) || !seen_depths.insert(depth) {
                 return Err(invalid(format!("Line {line_number}: duplicate node or depth")));
             }
+
             nodes.push((depth, node_id));
         }
+
+        if target.is_none() {
+            return Err(invalid(format!(
+                        "Target {final_target_id} not found in intermediate-node CSV"
+            )));
+        }
+
         nodes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         Ok(nodes.into_iter().map(|(_, node_id)| node_id).collect())
     }
 
     fn select_learning_target(&self) -> Option<LearningTarget> {
-        let reached_final_count = self.samples.iter().filter(|sample| sample.reached_final).count();
-        if reached_final_count >= 50 && self.samples.len() - reached_final_count >= 50 {
-            return Some(LearningTarget::Final);
-        }
+        match self.learning_target {
+            None => {
+                let reached_final_count = self.samples.iter().filter(|sample| sample.reached_final).count();
+                if reached_final_count >= 50 && self.samples.len() - reached_final_count >= 50 {
+                    return Some(LearningTarget::Final);
+                }
 
-        for intermediate_index in self.intermediate_chain.iter().rev() {
-            let reached_intermediates_count = self.samples.iter()
-                .filter(|sample| sample.reached_intermediates.contains(intermediate_index)).count();
-            if reached_intermediates_count >= 50 && self.samples.len() - reached_intermediates_count >= 50 {
-                return Some(LearningTarget::Intermediate(*intermediate_index));
-            }
+                for intermediate_index in self.intermediate_chain.iter().rev() {
+                    let reached_intermediates_count = self.samples.iter()
+                        .filter(|sample| sample.reached_intermediates.contains(intermediate_index)).count();
+                    if reached_intermediates_count >= 50 && self.samples.len() - reached_intermediates_count >= 50 {
+                        return Some(LearningTarget::Intermediate(*intermediate_index));
+                    }
+                }
+            },
+            Some(LearningTarget::Intermediate(id)) => {
+                let reached_final_count = self.samples.iter().filter(|sample| sample.reached_final).count();
+                if reached_final_count >= 50 && self.samples.len() - reached_final_count >= 50 {
+                    return Some(LearningTarget::Final);
+                }
+                
+                let Some(pos_id) = self.intermediate_chain.iter().position(|&x| x == id) else { 
+                    println!("Failed to get position of pos_id...");
+                    return None;
+                };
+
+                for intermediate_index in self.intermediate_chain[pos_id..].iter().rev() {
+                    let reached_intermediates_count = self.samples.iter()
+                        .filter(|sample| sample.reached_intermediates.contains(intermediate_index)).count();
+                    if reached_intermediates_count >= 50 && self.samples.len() - reached_intermediates_count >= 50 {
+                        return Some(LearningTarget::Intermediate(*intermediate_index));
+                    }
+                }
+                return Some(LearningTarget::Intermediate(id));
+            },
+            Some(LearningTarget::Final) => return Some(LearningTarget::Final)
         }
 
         None
@@ -213,8 +278,20 @@ impl MlFilter {
 impl FilterTrait for MlFilter {
     
     fn make_decision(&mut self, features: &MutantFeatures) -> Decision {
+        if let FilterPhase::Calibrating { calibrations } = &mut self.phase {
+            if *calibrations == 0 {
+                self.calibrating_probs.clear();
+                self.calibrating_labels.clear();
+            }
+        }
+
+
         if let FilterPhase::Filtering { decisions } = &mut self.phase {
             if *decisions >= 10_000 {
+                println!("Filtering target hits: execute={} | explore={}", self.target_execute, self.target_explore);
+                self.target_execute = 0;
+                self.target_explore = 0;
+
                 self.phase = FilterPhase::Collecting;
                 self.samples.clear();
                 println!("Start Collectig...");
@@ -244,22 +321,23 @@ impl FilterTrait for MlFilter {
                     None
                 }
             };
-
+            
             if self.pred_succes + self.pred_errors == 1000 {
                 println!("ERRORS: {} | SUCCESSES: {}", self.pred_errors, self.pred_succes);
             }
 
-            match prob {
-                Some(p) if p < self.threshold => {
-                    let val = self.rng.below(1_000_000);
-                    let th = (self.exploration_prob * 1_000_000.0) as u64;
-                    if val < th {
-                        Decision::ExecuteDespite
-                    } else {
-                        Decision::Discard
+            if matches!(self.phase, FilterPhase::Calibrating { .. }) {
+                self.calibrating_probs.push(prob);
+                Decision::Execute
+            } else {
+                match prob {
+                    Some(p) if p < self.threshold => {
+                        let val = self.rng.below(1_000_000);
+                        let th = (self.exploration_prob * 1_000_000.0) as u64;
+                        if val < th { Decision::ExecuteDespite } else { Decision::Discard }
                     }
+                    _ => Decision::Execute,
                 }
-                _ => Decision::Execute,
             }
         };
 
@@ -275,11 +353,56 @@ impl FilterTrait for MlFilter {
                 self.executed, self.discarded, self.explored
             );
         }
+
+        self.last_decision = Some(decision);
         decision
     }
     
     fn make_observation(&mut self, _features: &MutantFeatures, _outcome: &MutantOutcome) {
-        if self.phase != FilterPhase::Collecting {
+        let last_decision = self.last_decision.take();
+        
+        let reached = match self.learning_target {
+            Some(LearningTarget::Final) => _outcome.reached_targets.contains(&self.final_target_id),
+            Some(LearningTarget::Intermediate(id)) => _outcome.reached_intermediates.contains(&id),
+            None => false,
+        };
+
+        if let FilterPhase::Calibrating { calibrations } = &mut self.phase {
+            self.calibrating_labels.push(reached);
+            *calibrations += 1;
+
+            if *calibrations == 500 {
+                let mut positive_probs: Vec<f32> = self.calibrating_probs.iter()
+                    .zip(&self.calibrating_labels)
+                    .filter_map(|(prob, label)| if *label { *prob } else { None })
+                    .collect();
+                let errors = self.calibrating_probs.iter().filter(|p| p.is_none()).count();
+                // With insufficient evidence, threshold zero disables rejection.
+                if positive_probs.len() < 50 || errors != 0 {
+                    self.threshold = 0.0;
+                    println!("Calibration insufficient: positives={} errors={}; rejection disabled this cycle",
+                             positive_probs.len(), errors);
+                } else {
+                    positive_probs.sort_by(f32::total_cmp);
+                    self.threshold = positive_probs[positive_probs.len() / 100];
+                    println!("Calibration threshold: {} | positives: {}",
+                             self.threshold, positive_probs.len());
+                }
+                self.calibrating_probs.clear();
+                self.calibrating_labels.clear();
+                self.phase = FilterPhase::Filtering { decisions: 0 };
+            }
+            return;
+        }
+
+        if matches!(self.phase, FilterPhase::Filtering { .. }) {
+            if reached {
+                match last_decision {
+                    Some(Decision::Execute) => self.target_execute += 1,
+                    Some(Decision::ExecuteDespite) => self.target_explore += 1,
+                    _ => {},
+                }
+            }
             return;
         }
 
@@ -293,34 +416,48 @@ impl FilterTrait for MlFilter {
             let training_sample = TrainingSample{
                 features: _features.clone(),
                 reached_intermediates: _outcome.reached_intermediates.clone(),
-                reached_final: _outcome.target > 0,
+                reached_final: _outcome.reached_targets.contains(&self.final_target_id),
             };    
         
             self.samples.push(training_sample);
         
             if self.samples.len() == self.max_samples {
+                println!("Collected: {}", self.samples.len());
+                for idx in self.intermediate_chain.iter() {
+                    let reached_intermediates_count = self.samples.iter()
+                        .filter(|sample| sample.reached_intermediates.contains(idx)).count();
+                    println!("intermidiate {}: {}/{}", *idx, reached_intermediates_count, self.samples.len());
+                }
+
                 let learning_target = match self.select_learning_target() {
-                    Some(target) => target,
+                    Some(target) => Some(target),
                     None => {
                         println!("Failed to get new learning_target");
+                        if self.model_ready {
+                            self.phase = FilterPhase::Filtering{ decisions: 0 };
+                        }
                         self.samples.clear();
                         self.intermediate_hits.fill(0);
                         return;
                     }
                 };
-
+                    
                 if learning_target != self.learning_target {
                     match self.model_reset() {
                         Ok(0) => {
                             println!("model_reset because of changing learning_target: {:?} -> {:?}",
                                 self.learning_target, learning_target);
                             self.learning_target = learning_target;
+
+                            self.model_ready = false;
                         },
                         Ok(code) => {
                             println!("model_reset Error: code({})...", code);
                             self.samples.clear();
                             self.phase = FilterPhase::Collecting;
                             self.intermediate_hits.fill(0);
+                            
+                            self.model_ready = false;
                             return;
                         },
                         Err(err) => {
@@ -328,6 +465,8 @@ impl FilterTrait for MlFilter {
                             self.samples.clear();
                             self.phase = FilterPhase::Collecting;
                             self.intermediate_hits.fill(0);
+                            
+                            self.model_ready = false;
                             return;
                         }
                     }
@@ -340,6 +479,17 @@ impl FilterTrait for MlFilter {
                     self.samples.len(), positive, negative
                 );
                 
+                if positive < 50 || negative < 50 {
+                    println!("Skipping training: insufficient examples of both classes; keeping current model");
+                    if self.model_ready {
+                        self.phase = FilterPhase::Filtering { decisions: 0 };
+                    }
+
+                    self.samples.clear();
+                    self.intermediate_hits.fill(0);
+                    return;
+                }
+
                 for i in 0..self.intermediate_hits.len() {
                     if self.intermediate_hits[i] != 0 {
                         println!("Intermediate {}: {} / {}", i, self.intermediate_hits[i], self.samples.len());
@@ -350,18 +500,21 @@ impl FilterTrait for MlFilter {
 
                 match self.train() {
                     Ok(0) => {
-                        self.phase = FilterPhase::Filtering { decisions: 0 };
+                        self.phase = FilterPhase::Calibrating { calibrations: 0 };
                         self.samples.clear();
+                        self.model_ready = true;
                         println!("Training completed; filtering started...");
                     },
                     Ok(code) => {
                         self.phase = FilterPhase::Collecting;
                         self.samples.clear();
+                        self.model_ready = false;
                         println!("Failed to train model (Code: {})...", code);
                     },
                     Err(err) => {
                         self.phase = FilterPhase::Collecting;
                         self.samples.clear();
+                        self.model_ready = false;
                         println!("Error occured: {}", err)
                     }
                 }
