@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 
+use libafl::Evaluator;
+
 use clap::{Parser, ValueEnum};
 use libafl::{
     bolts::{
@@ -52,6 +54,7 @@ use libafl_targets::{
 
 use libaflgo::{CoolingSchedule, DistanceFeedback};
 use libaflgo::filter::{FilterDistancePowerMutationalStage};
+use libaflgo::symcc::{StagnationTracker};
 use libaflgo::ml_filter::MlFilter;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
 use libaflgo_targets::intermediate::get_intermediate_map_observer;
@@ -329,7 +332,8 @@ fn fuzz<P: AsRef<Path>>(
     )?;
     
     // TODO change to our realisation
-    //
+    
+    // let symcc = 
     
     let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so", 
         1337, "/home/light/Projects/fuzz_hybrid/test_libpng/aflgo_ml/intermediate_nodes.csv");
@@ -343,7 +347,9 @@ fn fuzz<P: AsRef<Path>>(
         },
     };
 
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter))?;
+    let stagnation_tracker = StagnationTracker::new(Duration::from_secs(10));
+
+    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter), stagnation_tracker)?;
 
 
     // A minimization+queue policy to get testcasess from the corpus
@@ -434,6 +440,22 @@ fn fuzz<P: AsRef<Path>>(
                 process::exit(0);
             });
         println!("We imported {} inputs from disk.", state.corpus().count());
+    
+        let inputs = libaflgo::symcc::read_unique_inputs(Path::new(
+                "/home/light/Projects/fuzz_hybrid/test_libpng/symcc/results",
+        ))?;
+    
+        let mut count_added = 0;
+        let count_executed = inputs.len();
+        for bytes in inputs {
+            let input = BytesInput::new(bytes);
+            let (_result, new_idx) = fuzzer.evaluate_input(&mut state, &mut executor, &mut mgr, input)?;
+            if new_idx.is_some() {
+                count_added += 1;
+            }
+        }
+
+        println!("[SYMCC] Count executed: {} | Count added {}", count_executed, count_added);
     }
 
     // Remove target ouput (logs still survive)

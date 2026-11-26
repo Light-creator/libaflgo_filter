@@ -5,6 +5,9 @@ use std::fs::File;
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader};
 
+const CALIBRATION_SAMPLES: usize = 1000;
+const POSITIVE_THRESHOLD: usize = 30;
+
 #[derive(Debug)]
 pub struct TrainingSample {
     pub features: MutantFeatures,
@@ -371,14 +374,14 @@ impl FilterTrait for MlFilter {
             self.calibrating_labels.push(reached);
             *calibrations += 1;
 
-            if *calibrations == 500 {
+            if *calibrations == CALIBRATION_SAMPLES {
                 let mut positive_probs: Vec<f32> = self.calibrating_probs.iter()
                     .zip(&self.calibrating_labels)
                     .filter_map(|(prob, label)| if *label { *prob } else { None })
                     .collect();
                 let errors = self.calibrating_probs.iter().filter(|p| p.is_none()).count();
                 // With insufficient evidence, threshold zero disables rejection.
-                if positive_probs.len() < 50 || errors != 0 {
+                if positive_probs.len() < POSITIVE_THRESHOLD || errors != 0 {
                     self.threshold = 0.0;
                     println!("Calibration insufficient: positives={} errors={}; rejection disabled this cycle",
                              positive_probs.len(), errors);

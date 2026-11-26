@@ -6,6 +6,7 @@ use crate::DistanceObserver;
 use crate::DistanceTestcaseMetadata;
 use crate::png_features::{extract_png_features};
 
+use crate::symcc::{StagnationTracker, run_symcc, read_unique_inputs};
 use crate::input_filter::{FilterTrait, MutantFeatures, MutantOutcome, Decision};
 
 use libafl::{
@@ -33,7 +34,8 @@ pub struct FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3> {
     dist_name: String,
     targets_name: String,
     intermediate_name: String,
-    filter: Box<dyn FilterTrait>
+    filter: Box<dyn FilterTrait>,
+    stagnation_tracker: StagnationTracker
 }
 
 impl<E, F, EM, I, M, Z, O1, O2, O3> UsesState for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
@@ -52,7 +54,7 @@ where
     E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
     Z: Evaluator<E, EM, State = E::State>,
     I: MutatedTransform<E::Input, E::State> + Clone,
-    E::Input: HasTargetBytes,
+    E::Input: HasTargetBytes + From<Vec<u8>>,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
     O3: MapObserver,
@@ -99,7 +101,7 @@ where
         
         let Ok(input) = I::try_transform_from(&mut testcase, state, corpus_idx) else { return Ok(()); };
         drop(testcase);
-    
+
         for i in 0..num {
             let mut input = input.clone();
 
@@ -152,46 +154,17 @@ where
 
             let (eval_result, new_idx) = fuzzer.evaluate_input(state, executor, manager, untransformed)?;
 
-            // Сбор данных
-            
-            // Находим обсерверы и достаем их них информацию о расстоянии и достижении цели
-            let observers = executor.observers();
-
-            let dist_observer = observers.match_name::<O1>(&self.dist_name).ok_or_else(|| {
-                libafl::Error::key_not_found("DistanceObserver not found".to_string())
-            })?;
-            
-            let targets_observer = observers.match_name::<O2>(&self.targets_name).ok_or_else(|| {
-                libafl::Error::key_not_found("MapObserver not found".to_string())
-            })?;
-
-            let intermediate_observer = observers.match_name::<O3>(&self.intermediate_name).ok_or_else(|| {
-                libafl::Error::key_not_found("IntermediateObserver not found".to_string())
-            })?;
-
-
-            let initial = targets_observer.initial();
-
+            let mut mut_dist = 0.0_f64;
+            let mut target = 0_u64;
             let mut reached_targets: Vec<usize> = vec![];
-            for index in 0..targets_observer.usable_count() {
-                let value = *targets_observer.get(index);
-
-                if value != initial {
-                    reached_targets.push(index);
-                }
-            }
-
             let mut reached_intermediates: Vec<usize> = vec![];
-            for index in 0..intermediate_observer.usable_count() {
-                let value = *intermediate_observer.get(index);
+            
+            self.do_observers(executor, &mut reached_intermediates, &mut reached_targets,
+                &mut mut_dist, &mut target)?;
+            
 
-                if value != intermediate_observer.initial() {
-                    reached_intermediates.push(index);
-                }
-            }
-
-            let mut_dist = dist_observer.distance();
-            let target = targets_observer.count_bytes();
+            // Проверяем застопорился ли фаззер (Нужно ли вызывать symCC?)
+            self.stagnation_tracker.observe(new_idx.is_some(), mut_dist, &reached_intermediates, &reached_targets);
 
             // MutantOutcome для дообучения модели
             let mut_outcome = MutantOutcome{
@@ -217,6 +190,67 @@ where
 
             self.mutator_mut().post_exec(state, i as i32, new_idx)?;
             post.post_exec(state, i as i32, new_idx)?;
+
+            if self.stagnation_tracker.should_trigger() {
+                println!("[SYMCC] Stagnation detected; symbolic execution requested");
+
+                let attempt_result = (|| -> Result<(), Error> {
+                    let bytes_symcc = {
+                        let mut testcase = state.corpus().get(corpus_idx)?.borrow_mut();
+                        let parent = testcase.load_input(state.corpus())?;
+                        parent.target_bytes().as_slice().to_vec()
+                    };
+
+                    match run_symcc(&bytes_symcc) {
+                        Ok(res_dir) => {
+                            println!("[SYMCC] Path to result dir: {}", res_dir.display());
+                            let inputs_symcc = match read_unique_inputs(&res_dir) {
+                                Ok(res_read) => Some(res_read),
+                                Err(err) => {
+                                    println!("[SYMCC] Failed to read inputs: {}", err);
+                                    None
+                                }
+                            };
+
+                            let mut eval_counter = 0;
+                            let mut added_counter = 0;
+                            if let Some(inputs) = inputs_symcc {
+                                for bytes in inputs {
+                                    let input = E::Input::from(bytes);
+                                    let (_result, new_idx) = fuzzer.evaluate_input(state, executor, manager, input)?;
+                                    eval_counter += 1;
+
+                                    if new_idx.is_some() {
+                                        added_counter += 1;
+                                    }
+
+                                    let mut distance = 0.0_f64;
+                                    let mut _target = 0_u64;
+                                    let mut reached_targets: Vec<usize> = vec![];
+                                    let mut reached_intermediates: Vec<usize> = vec![];
+
+                                    self.do_observers(executor, &mut reached_intermediates, &mut reached_targets,
+                                        &mut distance, &mut _target)?;
+
+                                    self.stagnation_tracker.observe(
+                                        new_idx.is_some(),
+                                        distance,
+                                        &reached_intermediates,
+                                        &reached_targets
+                                    );
+                                }
+                                println!("[SYMCC] eval_counter: {} | added_counter {}", eval_counter, added_counter);
+                            }
+                        },
+                        Err(err) => {
+                            println!("[SYMCC] Failed to run symcc: {}", err);
+                        }
+                    }
+                    Ok(())
+                })();
+                self.stagnation_tracker.finish_attempt();
+                attempt_result?;
+            }
         }
 
         self.buff.flush()?;
@@ -233,7 +267,7 @@ where
     E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
     Z: Evaluator<E, EM, State = E::State>,
     I: MutatedTransform<E::Input, E::State> + Clone,
-    E::Input: HasTargetBytes,
+    E::Input: HasTargetBytes + From<Vec<u8>>,
     O1: DistanceObserver<E::State>,
     O2: MapObserver,
     O3: MapObserver,
@@ -266,8 +300,8 @@ where
     O3: MapObserver,
 {
     /// Creates a new [`FilterPowerMutationalStage`]
-    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
-        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter)
+    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker) -> Result<Self, Error> {
+        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter, stagnation_tracker)
     }
 }
 
@@ -285,7 +319,7 @@ where
     O3: MapObserver,
 {
     /// Creates a new transforming [`FilterPwerMutationalStage`]
-    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>) -> Result<Self, Error> {
+    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker) -> Result<Self, Error> {
         let mut out = BufWriter::new(File::create("data.csv")?);
         writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,valid_signature,width,height,bit_depth,color_type")?;
         
@@ -296,8 +330,52 @@ where
             dist_name: dist_observer.name().to_string(),
             targets_name: targets_observer.name().to_string(),
             intermediate_name: intermediate_observer.name().to_string(),
-            filter
+            filter,
+            stagnation_tracker
         })
+    }
+
+    pub fn do_observers(&self, executor: &E, reached_intermediates: &mut Vec<usize>, 
+        reached_targets: &mut Vec<usize>, distance: &mut f64, target: &mut u64) -> Result<(), Error> {
+            let observers = executor.observers();
+
+            let dist_observer = observers.match_name::<O1>(&self.dist_name).ok_or_else(|| {
+                libafl::Error::key_not_found("DistanceObserver not found".to_string())
+            })?;
+            
+            let targets_observer = observers.match_name::<O2>(&self.targets_name).ok_or_else(|| {
+                libafl::Error::key_not_found("MapObserver not found".to_string())
+            })?;
+
+            let intermediate_observer = observers.match_name::<O3>(&self.intermediate_name).ok_or_else(|| {
+                libafl::Error::key_not_found("IntermediateObserver not found".to_string())
+            })?;
+
+            reached_targets.clear();
+            reached_intermediates.clear();
+
+            let initial = targets_observer.initial();
+
+            for index in 0..targets_observer.usable_count() {
+                let value = *targets_observer.get(index);
+
+                if value != initial {
+                    reached_targets.push(index);
+                }
+            }
+
+            for index in 0..intermediate_observer.usable_count() {
+                let value = *intermediate_observer.get(index);
+
+                if value != intermediate_observer.initial() {
+                    reached_intermediates.push(index);
+                }
+            }
+
+            *distance = dist_observer.distance();
+            *target = targets_observer.count_bytes();
+
+            Ok(())
     }
 }
 
