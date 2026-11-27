@@ -9,3 +9,5 @@ rust-version.workspace = true
 libafl = { workspace = true }
 serde = { version = "1.0.160", features = ["derive"] }
 libloading = "=0.8.6"
+
+libc = "=0.2.153"

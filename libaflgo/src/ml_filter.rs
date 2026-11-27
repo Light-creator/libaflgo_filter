@@ -1,3 +1,4 @@
+use std::path::Path;
 
 use crate::input_filter::{MutantFeatures, MutantOutcome, FilterTrait, Decision};
 use libafl::bolts::rands::{Rand, StdRand};
@@ -75,7 +76,7 @@ pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
 } 
 
 impl MlFilter {
-    pub fn new(max_samples: usize, path: &str, seed: u64, node_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(max_samples: usize, path: &Path, seed: u64, node_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let library = unsafe { libloading::Library::new(path) }?;
     
         let intermediate_chain = Self::read_target_csv(node_path, 0)?;
@@ -155,7 +156,7 @@ impl MlFilter {
         }
     }
 
-    fn read_target_csv(path: &str, final_target_id: usize) -> io::Result<Vec<usize>> {
+    fn read_target_csv(path: &Path, final_target_id: usize) -> io::Result<Vec<usize>> {
         let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
         let mut lines = BufReader::new(File::open(path)?).lines();
         let header = lines.next().transpose()?.ok_or_else(|| {

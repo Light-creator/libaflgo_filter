@@ -54,7 +54,7 @@ use libafl_targets::{
 
 use libaflgo::{CoolingSchedule, DistanceFeedback};
 use libaflgo::filter::{FilterDistancePowerMutationalStage};
-use libaflgo::symcc::{StagnationTracker};
+use libaflgo::symcc::{StagnationTracker, SymccConfig};
 use libaflgo::ml_filter::MlFilter;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
 use libaflgo_targets::intermediate::get_intermediate_map_observer;
@@ -63,6 +63,19 @@ use libaflgo_targets::intermediate::get_intermediate_map_observer;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
+    #[arg(long)]
+    ml_library: PathBuf,
+    #[arg(long)]
+    intermediate_nodes: PathBuf,
+    #[arg(long, requires_all = ["symcc_binary", "symcc_work_dir"])]
+    enable_symcc: bool,
+    #[arg(long)]
+    symcc_binary: Option<PathBuf>,
+    #[arg(long)]
+    symcc_work_dir: Option<PathBuf>,
+    #[arg(long)]
+    symcc_import_dir: Option<PathBuf>,
+
     /// The directory to place finds in ('corpus')
     #[arg(short, long)]
     output: PathBuf,
@@ -162,6 +175,24 @@ pub fn libafl_main() {
         return;
     }
 
+    let symcc_config = if args.enable_symcc {
+        let binary = match args.symcc_binary.as_ref().and_then(|p| p.canonicalize().ok()) {
+            Some(path) if path.is_file() => path,
+            _ => { eprintln!("Invalid --symcc-binary"); return; }
+        };
+        let work_dir = match args.symcc_work_dir.as_ref() {
+            Some(path) => path,
+            None => { eprintln!("Missing --symcc-work-dir"); return; }
+        };
+        if let Err(error) = fs::create_dir_all(work_dir) {
+            eprintln!("Cannot create SymCC work directory: {error}"); return;
+        }
+        match work_dir.canonicalize() {
+            Ok(work_dir) => Some(SymccConfig { binary, work_dir }),
+            Err(error) => { eprintln!("Invalid SymCC work directory: {error}"); return; }
+        }
+    } else { None };
+
     if let Err(error) = fuzz(
         out_dir.join("queue"),
         out_dir.join("crashes"),
@@ -172,6 +203,10 @@ pub fn libafl_main() {
         args.show_target_output,
         args.cooling_schedule.0,
         Duration::from_secs(args.time_to_exploit * 60),
+        args.ml_library,
+        args.intermediate_nodes,
+        symcc_config,
+        args.symcc_import_dir,
     ) {
         panic!("An error occurred while fuzzing: {error}");
     }
@@ -212,6 +247,10 @@ fn fuzz<P: AsRef<Path>>(
     show_target_output: bool,
     cooling_schedule: CoolingSchedule,
     time_to_exploit: Duration,
+    ml_library: PathBuf,
+    intermediate_nodes: PathBuf,
+    symcc_config: Option<SymccConfig>,
+    symcc_import_dir: Option<PathBuf>,
 ) -> Result<(), Error> {
     let log = RefCell::new(
         OpenOptions::new()
@@ -335,21 +374,20 @@ fn fuzz<P: AsRef<Path>>(
     
     // let symcc = 
     
-    let ml_filter_res = MlFilter::new(1000, "/home/light/Projects/fuzz_hybrid/ml_model/target/debug/libml_model.so", 
-        1337, "/home/light/Projects/fuzz_hybrid/test_libpng/aflgo_ml/intermediate_nodes.csv");
+    let ml_filter_res = MlFilter::new(1000, &ml_library, 1337, &intermediate_nodes);
 
     let ml_filter = match ml_filter_res {
         Ok(res) => res,
         Err(err) => {
             return Err(Error::illegal_argument(format!(
-                "Failed to load ML model library: {err}"
+                "Failed to initialize ML filter: {err}"
             )));
         },
     };
 
     let stagnation_tracker = StagnationTracker::new(Duration::from_secs(10));
 
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter), stagnation_tracker)?;
+    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter), stagnation_tracker, symcc_config)?;
 
 
     // A minimization+queue policy to get testcasess from the corpus
@@ -441,10 +479,8 @@ fn fuzz<P: AsRef<Path>>(
             });
         println!("We imported {} inputs from disk.", state.corpus().count());
     
-        let inputs = libaflgo::symcc::read_unique_inputs(Path::new(
-                "/home/light/Projects/fuzz_hybrid/test_libpng/symcc/results",
-        ))?;
-    
+        if let Some(directory) = symcc_import_dir.as_ref() {
+            let inputs = libaflgo::symcc::read_unique_inputs(directory)?;
         let mut count_added = 0;
         let count_executed = inputs.len();
         for bytes in inputs {
@@ -456,6 +492,7 @@ fn fuzz<P: AsRef<Path>>(
         }
 
         println!("[SYMCC] Count executed: {} | Count added {}", count_executed, count_added);
+        }
     }
 
     // Remove target ouput (logs still survive)

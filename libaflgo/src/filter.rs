@@ -6,7 +6,7 @@ use crate::DistanceObserver;
 use crate::DistanceTestcaseMetadata;
 use crate::png_features::{extract_png_features};
 
-use crate::symcc::{StagnationTracker, run_symcc, read_unique_inputs};
+use crate::symcc::{StagnationTracker, SymccConfig, run_symcc, read_unique_inputs};
 use crate::input_filter::{FilterTrait, MutantFeatures, MutantOutcome, Decision};
 
 use libafl::{
@@ -35,7 +35,8 @@ pub struct FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3> {
     targets_name: String,
     intermediate_name: String,
     filter: Box<dyn FilterTrait>,
-    stagnation_tracker: StagnationTracker
+    stagnation_tracker: StagnationTracker,
+    symcc_config: Option<SymccConfig>,
 }
 
 impl<E, F, EM, I, M, Z, O1, O2, O3> UsesState for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
@@ -191,7 +192,7 @@ where
             self.mutator_mut().post_exec(state, i as i32, new_idx)?;
             post.post_exec(state, i as i32, new_idx)?;
 
-            if self.stagnation_tracker.should_trigger() {
+            if self.symcc_config.is_some() && self.stagnation_tracker.should_trigger() {
                 println!("[SYMCC] Stagnation detected; symbolic execution requested");
 
                 let attempt_result = (|| -> Result<(), Error> {
@@ -201,7 +202,7 @@ where
                         parent.target_bytes().as_slice().to_vec()
                     };
 
-                    match run_symcc(&bytes_symcc) {
+                    match run_symcc(&bytes_symcc, self.symcc_config.as_ref().ok_or_else(|| Error::illegal_argument("Missing SymCC configuration"))?) {
                         Ok(res_dir) => {
                             println!("[SYMCC] Path to result dir: {}", res_dir.display());
                             let inputs_symcc = match read_unique_inputs(&res_dir) {
@@ -300,8 +301,8 @@ where
     O3: MapObserver,
 {
     /// Creates a new [`FilterPowerMutationalStage`]
-    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker) -> Result<Self, Error> {
-        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter, stagnation_tracker)
+    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>) -> Result<Self, Error> {
+        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter, stagnation_tracker, symcc_config)
     }
 }
 
@@ -319,7 +320,7 @@ where
     O3: MapObserver,
 {
     /// Creates a new transforming [`FilterPwerMutationalStage`]
-    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker) -> Result<Self, Error> {
+    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>) -> Result<Self, Error> {
         let mut out = BufWriter::new(File::create("data.csv")?);
         writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,valid_signature,width,height,bit_depth,color_type")?;
         
@@ -331,7 +332,8 @@ where
             targets_name: targets_observer.name().to_string(),
             intermediate_name: intermediate_observer.name().to_string(),
             filter,
-            stagnation_tracker
+            stagnation_tracker,
+            symcc_config,
         })
     }
 

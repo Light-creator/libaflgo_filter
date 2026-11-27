@@ -3,10 +3,57 @@ use std::{path::PathBuf, process::Command, sync::atomic::{AtomicU64, Ordering}};
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// RAII keeps the segment alive until the child exits and unlinks it on errors.
+struct SharedInput {
+    name: std::ffi::CString,
+    file: std::fs::File,
+}
+
+impl SharedInput {
+    fn new(input: &[u8]) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        use std::io::Write;
+        if input.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Empty SymCC input"));
+        }
+        loop {
+            let number = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = std::ffi::CString::new(format!("/png-symcc-{}-{number}", std::process::id()))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            // Exclusive creation prevents collisions with another run.
+            let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists { continue; }
+                return Err(error);
+            }
+            let mut shared = Self { name, file: unsafe { std::fs::File::from_raw_fd(fd) } };
+            shared.file.set_len(input.len() as u64)?;
+            // Writing the shm descriptor populates memory; no disk input file is made.
+            shared.file.write_all(input)?;
+            return Ok(shared);
+        }
+    }
+}
+
+impl Drop for SharedInput {
+    fn drop(&mut self) {
+        if unsafe { libc::shm_unlink(self.name.as_ptr()) } != 0 {
+            eprintln!("[SYMCC] Failed to unlink shared input: {}", io::Error::last_os_error());
+        }
+    }
+}
+
 /// Run the separately instrumented target once. Partial results remain usable
 /// after a timeout or target crash; spawn and filesystem errors are propagated.
-pub fn run_symcc(input: &[u8]) -> io::Result<PathBuf> {
-    let root = Path::new("/home/light/Projects/fuzz_hybrid/test_libpng/symcc/runs");
+#[derive(Debug)]
+pub struct SymccConfig {
+    pub binary: PathBuf,
+    pub work_dir: PathBuf,
+}
+
+pub fn run_symcc(input: &[u8], config: &SymccConfig) -> io::Result<PathBuf> {
+    let root = &config.work_dir;
     fs::create_dir_all(root)?;
     // create_dir atomically reserves a fresh directory, including after restarts.
     let run_dir = loop {
@@ -18,16 +65,19 @@ pub fn run_symcc(input: &[u8]) -> io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     };
-    let input_path = run_dir.join("input.png");
+    let shared = SharedInput::new(input)?;
     let results = run_dir.join("results");
     fs::create_dir(&results)?;
-    fs::write(&input_path, input)?;
+
 
     let status = Command::new("timeout")
         .args(["-k", "5s", "30s"])
-        .arg("/home/light/Projects/fuzz_hybrid/test_libpng/symcc/png_symcc")
-        .arg(&input_path)
-        .env("SYMCC_INPUT_FILE", &input_path)
+        .arg(&config.binary)
+        .arg(std::ffi::OsStr::new(shared.name.to_str().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?))
+        .arg(input.len().to_string())
+        .env_remove("SYMCC_INPUT_FILE")
+        .env_remove("SYMCC_NO_SYMBOLIC_INPUT")
+        .env("SYMCC_MEMORY_INPUT", "1")
         .env("SYMCC_OUTPUT_DIR", &results)
         .status()?;
     println!("[SYMCC] Completed: {} | results: {}", status, results.display());
