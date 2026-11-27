@@ -1,6 +1,8 @@
 use std::{collections::HashSet, fs, io, path::Path, time::{Duration, Instant}};
 use std::{path::PathBuf, process::Command, sync::atomic::{AtomicU64, Ordering}};
 
+use libafl::prelude::CorpusId;
+
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // RAII keeps the segment alive until the child exits and unlinks it on errors.
@@ -97,6 +99,12 @@ pub enum StagnationState {
 }
 
 #[derive(Debug)]
+struct SymccCandidate {
+    corpus_id: CorpusId,
+    distance: f64
+}
+
+#[derive(Debug)]
 pub struct StagnationTracker {
     last_progress: Instant,
     timeout: Duration,
@@ -111,7 +119,10 @@ pub struct StagnationTracker {
     distance_progress: u64,
     node_progress: u64,
     progress_reason: &'static str,
-    state: StagnationState
+    state: StagnationState,
+    candidates: Vec<SymccCandidate>,
+    seen_candidates: HashSet<CorpusId>,
+    attempted_inputs: HashSet<Vec<u8>>
 }
 
 impl StagnationTracker {
@@ -131,7 +142,10 @@ impl StagnationTracker {
             distance_progress: 0,
             node_progress: 0,
             progress_reason: "initialization",
-            state: StagnationState::Idle
+            state: StagnationState::Idle,
+            candidates: Vec::new(),
+            seen_candidates: HashSet::new(),
+            attempted_inputs: HashSet::new()
         }
     }
 
@@ -229,6 +243,44 @@ impl StagnationTracker {
         } 
     }
 
+    pub fn observe_candidate(&mut self, corpus_id: CorpusId, distance: f64) {
+        if !distance.is_finite() || distance.is_nan() {
+            return;
+        }
+        
+        if let Some(candidate) = self.candidates.iter_mut().find(|x| (**x).corpus_id == corpus_id) {
+            candidate.distance = distance;
+        } else {
+            self.candidates.push(SymccCandidate{
+                corpus_id,
+                distance
+            });
+        }
+    }
+    
+    pub fn best_candidate(&mut self) -> Option<CorpusId> {
+        // let candidate = self.candidates.iter()
+        //     .min_by(|a, b| a.distance.total_cmp(&b.distance))
+        //     .map(|candidate| candidate.corpus_id);
+        //
+        // if let Some(c) = candidate {
+        //     self.seen_candidates.insert(c);
+        // }
+    
+        self.candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        for i in 0..self.candidates.len() {
+            if !self.seen_candidates.contains(&self.candidates[i].corpus_id) {
+                self.seen_candidates.insert(self.candidates[i].corpus_id);
+                return Some(self.candidates[i].corpus_id);
+            } 
+        }
+
+        None
+    }
+
+    pub fn register_input(&mut self, bytes: &[u8]) -> bool {
+        self.attempted_inputs.insert(bytes.to_vec())
+    }
 }
 
 /// Read one completed SymCC run, in filename order, deduplicating by contents.

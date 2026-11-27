@@ -103,6 +103,8 @@ where
         let Ok(input) = I::try_transform_from(&mut testcase, state, corpus_idx) else { return Ok(()); };
         drop(testcase);
 
+        self.stagnation_tracker.observe_candidate(corpus_idx, parent_dist);
+
         for i in 0..num {
             let mut input = input.clone();
 
@@ -163,6 +165,9 @@ where
             self.do_observers(executor, &mut reached_intermediates, &mut reached_targets,
                 &mut mut_dist, &mut target)?;
             
+            if let Some(id) = new_idx {
+                self.stagnation_tracker.observe_candidate(id, mut_dist);
+            }
 
             // Проверяем застопорился ли фаззер (Нужно ли вызывать symCC?)
             self.stagnation_tracker.observe(new_idx.is_some(), mut_dist, &reached_intermediates, &reached_targets);
@@ -196,10 +201,35 @@ where
                 println!("[SYMCC] Stagnation detected; symbolic execution requested");
 
                 let attempt_result = (|| -> Result<(), Error> {
-                    let bytes_symcc = {
-                        let mut testcase = state.corpus().get(corpus_idx)?.borrow_mut();
-                        let parent = testcase.load_input(state.corpus())?;
-                        parent.target_bytes().as_slice().to_vec()
+                    let bytes_symcc = loop {
+                        let candidate_idx = match self.stagnation_tracker.best_candidate() {
+                            Some(id) => id,
+                            None => {
+                                println!("[SYMCC] No unused candidates");
+                                
+                                let p_bytes = {
+                                    let mut testcase = state.corpus().get(corpus_idx)?.borrow_mut();
+                                    let input = testcase.load_input(state.corpus())?;
+                                    input.target_bytes().as_slice().to_vec()
+                                };
+
+                                if self.stagnation_tracker.register_input(&p_bytes) {
+                                    break p_bytes;
+                                }
+
+                                return Ok(());
+                            }
+                        };
+
+                        let bytes = {
+                            let mut testcase = state.corpus().get(candidate_idx)?.borrow_mut();
+                            let input = testcase.load_input(state.corpus())?;
+                            input.target_bytes().as_slice().to_vec()
+                        };
+
+                        if self.stagnation_tracker.register_input(&bytes) {
+                            break bytes;
+                        }
                     };
 
                     match run_symcc(&bytes_symcc, self.symcc_config.as_ref().ok_or_else(|| Error::illegal_argument("Missing SymCC configuration"))?) {
@@ -232,6 +262,10 @@ where
 
                                     self.do_observers(executor, &mut reached_intermediates, &mut reached_targets,
                                         &mut distance, &mut _target)?;
+                                    
+                                    if let Some(id) = new_idx {
+                                        self.stagnation_tracker.observe_candidate(id, distance);
+                                    }
 
                                     self.stagnation_tracker.observe(
                                         new_idx.is_some(),
