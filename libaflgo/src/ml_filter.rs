@@ -9,21 +9,21 @@ use std::io::{self, BufRead, BufReader};
 const CALIBRATION_SAMPLES: usize = 1000;
 const POSITIVE_THRESHOLD: usize = 30;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingSample {
     pub features: MutantFeatures,
     pub reached_intermediates: Vec<usize>,
     pub reached_final: bool
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FilterPhase {
     Filtering { decisions: usize },
     Collecting,
     Calibrating { calibrations: usize }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LearningTarget {
     Intermediate(usize),
     Final,
@@ -57,23 +57,23 @@ pub struct MlFilter {
     calibrating_labels: Vec<bool>,
 }
 
-pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
-    
-    let res: [f32; 10] = [
-        (features.mut_sz as f32).ln_1p(),
-        (features.png.valid_signature as i32) as f32,
-        ((features.png.width.is_some()) as i32) as f32,
-        (features.png.width.unwrap_or(0) as f32).ln_1p(),
-        ((features.png.height.is_some()) as i32) as f32,
-        (features.png.height.unwrap_or(0) as f32).ln_1p(),
-        ((features.png.bit_depth.is_some()) as i32) as f32,
-        ((features.png.bit_depth.unwrap_or(0)) as f32),
-        ((features.png.color_type.is_some()) as i32) as f32,
-        ((features.png.color_type.unwrap_or(0)) as f32),
-    ]; 
-    
-    res
-} 
+// pub fn prep_mutant_features(features: &MutantFeatures) -> [f32; 10] {
+//    
+//     let res: [f32; 10] = [
+//         (features.mut_sz as f32).ln_1p(),
+//         (features.png.valid_signature as i32) as f32,
+//         ((features.png.width.is_some()) as i32) as f32,
+//         (features.png.width.unwrap_or(0) as f32).ln_1p(),
+//         ((features.png.height.is_some()) as i32) as f32,
+//         (features.png.height.unwrap_or(0) as f32).ln_1p(),
+//         ((features.png.bit_depth.is_some()) as i32) as f32,
+//         ((features.png.bit_depth.unwrap_or(0)) as f32),
+//         ((features.png.color_type.is_some()) as i32) as f32,
+//         ((features.png.color_type.unwrap_or(0)) as f32),
+//     ]; 
+//    
+//     res
+// } 
 
 impl MlFilter {
     pub fn new(max_samples: usize, path: &Path, seed: u64, node_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -110,7 +110,8 @@ impl MlFilter {
 
     pub fn predict(&self, features: &MutantFeatures) -> Result<f32, libloading::Error> {
         
-        let mut_features = prep_mutant_features(features);
+        // let mut_features = prep_mutant_features(features);
+        let mut_features = features.features.as_slice();
         
         type Predict = unsafe extern "C" fn(*const f32, usize) -> f32;
         let model_func: libloading::Symbol<Predict> = unsafe { self.library.get(b"model_func\0") }?;
@@ -132,7 +133,8 @@ impl MlFilter {
         let mut features: Vec<f32> = vec![];
         let mut labels: Vec<f32> = vec![];
         for sample in self.samples.iter() {
-            features.extend_from_slice(&prep_mutant_features(&sample.features));
+            // features.extend_from_slice(&prep_mutant_features(&sample.features));
+            features.extend_from_slice(&sample.features.features.as_slice());
             if self.reached_learning_target(sample) { 
                 labels.push(1.0); 
             } else {
@@ -267,6 +269,17 @@ impl MlFilter {
         None
     }
 
+    fn model_file(&self, path: &Path, load: bool) -> io::Result<()> {
+        let path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let operation: libloading::Symbol<unsafe extern "C" fn(*const std::os::raw::c_char, bool) -> i32> =
+            unsafe { self.library.get(b"model_checkpoint\0") }
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if unsafe { operation(path.as_ptr(), load) } != 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "Model checkpoint failed"));
+        }
+        Ok(())
+    }
     fn model_reset(&self) -> Result<i32, libloading::Error> {
         type ModelReset = unsafe extern "C" fn() -> i32;
         let model_reset: libloading::Symbol<ModelReset> = unsafe { self.library.get(b"model_reset\0") }?;
@@ -281,6 +294,35 @@ impl MlFilter {
 
 impl FilterTrait for MlFilter {
     
+    fn checkpoint(&self, dir: &Path) -> io::Result<()> {
+        self.model_file(&dir.join("model.bpk"), false)?;
+        let data = bincode::serialize(&((&self.samples, &self.pred_succes, &self.pred_errors, &self.phase, &self.threshold, &self.rng, &self.executed, &self.discarded, &self.explored), (&self.intermediate_hits.to_vec(), &self.learning_target, &self.model_ready, &self.last_decision, &self.target_execute, &self.target_explore, &self.calibrating_probs, &self.calibrating_labels)))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        std::fs::write(dir.join("filter.bin"), data)
+    }
+    fn restore(&mut self, dir: &Path) -> io::Result<()> {
+        let snapshot: ((Vec<TrainingSample>, usize, usize, FilterPhase, f32, StdRand, u64, u64, u64), (Vec<usize>, Option<LearningTarget>, bool, Option<Decision>, u64, u64, Vec<Option<f32>>, Vec<bool>)) = bincode::deserialize(&std::fs::read(dir.join("filter.bin"))?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.model_file(&dir.join("model.bpk"), true)?;
+        self.samples = snapshot.0.0;
+        self.pred_succes = snapshot.0.1;
+        self.pred_errors = snapshot.0.2;
+        self.phase = snapshot.0.3;
+        self.threshold = snapshot.0.4;
+        self.rng = snapshot.0.5;
+        self.executed = snapshot.0.6;
+        self.discarded = snapshot.0.7;
+        self.explored = snapshot.0.8;
+        self.intermediate_hits = snapshot.1.0.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid hits map"))?;
+        self.learning_target = snapshot.1.1;
+        self.model_ready = snapshot.1.2;
+        self.last_decision = snapshot.1.3;
+        self.target_execute = snapshot.1.4;
+        self.target_explore = snapshot.1.5;
+        self.calibrating_probs = snapshot.1.6;
+        self.calibrating_labels = snapshot.1.7;
+        Ok(())
+    }
     fn make_decision(&mut self, features: &MutantFeatures) -> Decision {
         if let FilterPhase::Calibrating { calibrations } = &mut self.phase {
             if *calibrations == 0 {

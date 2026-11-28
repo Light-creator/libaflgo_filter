@@ -54,6 +54,7 @@ use libafl_targets::{
 
 use libaflgo::{CoolingSchedule, DistanceFeedback};
 use libaflgo::filter::{FilterDistancePowerMutationalStage};
+use libaflgo::png_features::{PngFeatureExtractor};
 use libaflgo::symcc::{StagnationTracker, SymccConfig};
 use libaflgo::ml_filter::MlFilter;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
@@ -63,8 +64,13 @@ use libaflgo_targets::intermediate::get_intermediate_map_observer;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
+    /// Save and restore periodic runtime checkpoints across automatic restarts.
     #[arg(long)]
-    ml_library: PathBuf,
+    enable_checkpoint: bool,
+    #[arg(long)]
+    enable_mlp: bool,
+    #[arg(long, required_if_eq("enable_mlp", "true"))]
+    ml_library: Option<PathBuf>,
     #[arg(long)]
     intermediate_nodes: PathBuf,
     #[arg(long, requires_all = ["symcc_binary", "symcc_work_dir"])]
@@ -203,6 +209,8 @@ pub fn libafl_main() {
         args.show_target_output,
         args.cooling_schedule.0,
         Duration::from_secs(args.time_to_exploit * 60),
+        args.enable_checkpoint,
+        args.enable_mlp,
         args.ml_library,
         args.intermediate_nodes,
         symcc_config,
@@ -247,7 +255,9 @@ fn fuzz<P: AsRef<Path>>(
     show_target_output: bool,
     cooling_schedule: CoolingSchedule,
     time_to_exploit: Duration,
-    ml_library: PathBuf,
+    enable_checkpoint: bool,
+    enable_mlp: bool,
+    ml_library: Option<PathBuf>,
     intermediate_nodes: PathBuf,
     symcc_config: Option<SymccConfig>,
     symcc_import_dir: Option<PathBuf>,
@@ -337,7 +347,7 @@ fn fuzz<P: AsRef<Path>>(
             // RNG
             StdRand::with_seed(current_nanos()),
             // Corpus that will be evolved, we keep it in memory for performance
-            InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
+            InMemoryOnDiskCorpus::new(corpus_dir.as_ref()).unwrap(),
             // Corpus in which we store solutions (crashes in this example),
             // on disk so the user can get them after stopping the fuzzer
             OnDiskCorpus::new(objective_dir).unwrap(),
@@ -374,20 +384,44 @@ fn fuzz<P: AsRef<Path>>(
     
     // let symcc = 
     
-    let ml_filter_res = MlFilter::new(1000, &ml_library, 1337, &intermediate_nodes);
+    let ml_filter: Box<dyn libaflgo::input_filter::FilterTrait> = if enable_mlp {
+        let library = ml_library.as_ref().ok_or_else(|| Error::illegal_argument("Missing --ml-library"))?;
+        
+        Box::new(MlFilter::new(1000, library, 1337, &intermediate_nodes)
+            .map_err(|e| Error::illegal_argument(format!("Failed to initialize ML filter: {e}")))?)
 
-    let ml_filter = match ml_filter_res {
-        Ok(res) => res,
-        Err(err) => {
-            return Err(Error::illegal_argument(format!(
-                "Failed to initialize ML filter: {err}"
-            )));
-        },
+    } else { 
+        Box::new(libaflgo::input_filter::PassAll) 
     };
 
     let stagnation_tracker = StagnationTracker::new(Duration::from_secs(10));
 
-    let power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, Box::new(ml_filter), stagnation_tracker, symcc_config)?;
+    let mut power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, ml_filter, stagnation_tracker, symcc_config, Box::new(PngFeatureExtractor))?;
+
+    if enable_checkpoint {
+        use std::hash::{Hash, Hasher};
+        
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        "runtime-checkpoint-v2".hash(&mut identity);
+        
+        enable_mlp.hash(&mut identity);
+        
+        std::fs::read(&intermediate_nodes)?.hash(&mut identity);
+        
+        if enable_mlp {
+            if let Some(path) = &ml_library { std::fs::read(path)?.hash(&mut identity); }
+        }
+        
+        let signature = identity.finish().to_le_bytes();
+        
+        power.configure_checkpoint(
+            corpus_dir.as_ref().parent().ok_or_else(|| Error::illegal_argument("Invalid corpus directory"))?.join("runtime-checkpoint"),
+            &signature,
+            !state.must_load_initial_inputs(),
+        )?;
+    }
+
+
 
 
     // A minimization+queue policy to get testcasess from the corpus

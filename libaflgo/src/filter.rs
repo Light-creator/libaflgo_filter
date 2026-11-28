@@ -4,10 +4,10 @@ use std::{fs::File, io::{BufWriter, Write}};
 use crate::DistancePowerTestcaseScore;
 use crate::DistanceObserver;
 use crate::DistanceTestcaseMetadata;
-use crate::png_features::{extract_png_features};
 
 use crate::symcc::{StagnationTracker, SymccConfig, run_symcc, read_unique_inputs};
 use crate::input_filter::{FilterTrait, MutantFeatures, MutantOutcome, Decision};
+use crate::features::FeatureExtractor;
 
 use libafl::{
     corpus::{Corpus, CorpusId},
@@ -36,7 +36,10 @@ pub struct FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3> {
     intermediate_name: String,
     filter: Box<dyn FilterTrait>,
     stagnation_tracker: StagnationTracker,
+    checkpoint_dir: Option<std::path::PathBuf>,
+    checkpoint_at: std::time::Instant,
     symcc_config: Option<SymccConfig>,
+    feature_extractor: Box<dyn FeatureExtractor>
 }
 
 impl<E, F, EM, I, M, Z, O1, O2, O3> UsesState for FilterPowerMutationalStage<E, F, EM, I, M, Z, O1, O2, O3>
@@ -120,8 +123,8 @@ where
             // Считаем размер мутанта
             let mut_sz = untransformed.target_bytes().as_slice().len();
 
-            // Извлекаем признаки png
-            let png = extract_png_features(
+            // Извлекаем признаки входа
+            let features = self.feature_extractor.extract_features(
                 untransformed.target_bytes().as_slice(),
             );
 
@@ -132,21 +135,16 @@ where
                 iter_count: num,
                 mut_sz: mut_sz,
                 parent_dist: parent_dist,
-                png: png
+                features
             };
 
-            let png_ref = &mut_features.png;
 
             let filter_res = self.filter.make_decision(&mut_features);
 
             if filter_res == Decision::Discard {
-                writeln!(self.buff, "{},{},{},{},{},,,,{:?},{},{},{},{},{}", 
+                writeln!(self.buff, "{},{},{},{},{},,,,{:?},\"{:?}\"",
                     corpus_idx, i, num, mut_sz, parent_dist, filter_res,
-                    png_ref.valid_signature, 
-                    png_ref.width.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.height.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.bit_depth.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.color_type.map(|v| v.to_string()).unwrap_or_default()
+                    mut_features.features
                 )?;
 
                 self.mutator_mut().post_exec(state, i as i32, None)?;
@@ -184,15 +182,11 @@ where
             self.filter.make_observation(&mut_features, &mut_outcome);
 
             // id, iter_id, iter_count, mut_sz, parent_dist, eval_result, mut_dist, target, decision
-            writeln!(self.buff, "{},{},{},{},{},{:?},{},{},{:?},{},{},{},{},{}", 
-                corpus_idx, i, num, mut_sz, parent_dist, 
+            writeln!(self.buff, "{},{},{},{},{},{:?},{},{},{:?},\"{:?}\"",
+                corpus_idx, i, num, mut_sz, parent_dist,
                 mut_outcome.eval_result, mut_dist, target, filter_res,
-                    png_ref.valid_signature, 
-                    png_ref.width.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.height.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.bit_depth.map(|v| v.to_string()).unwrap_or_default(), 
-                    png_ref.color_type.map(|v| v.to_string()).unwrap_or_default()
-                )?;
+                mut_features.features
+            )?;
 
             self.mutator_mut().post_exec(state, i as i32, new_idx)?;
             post.post_exec(state, i as i32, new_idx)?;
@@ -214,6 +208,7 @@ where
                                 };
 
                                 if self.stagnation_tracker.register_input(&p_bytes) {
+                                    println!("[SYMCC] parent was choosen");
                                     break p_bytes;
                                 }
 
@@ -228,6 +223,7 @@ where
                         };
 
                         if self.stagnation_tracker.register_input(&bytes) {
+                            println!("[SYMCC] mutant wa chosen {}", candidate_idx);
                             break bytes;
                         }
                     };
@@ -289,6 +285,7 @@ where
         }
 
         self.buff.flush()?;
+        self.save_checkpoint()?;
         Ok(())
     }
 }
@@ -335,8 +332,8 @@ where
     O3: MapObserver,
 {
     /// Creates a new [`FilterPowerMutationalStage`]
-    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>) -> Result<Self, Error> {
-        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter, stagnation_tracker, symcc_config)
+    pub fn new(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>, feature_extractor: Box<dyn FeatureExtractor>) -> Result<Self, Error> {
+        Self::transforming(mutator, dist_observer, targets_observer, intermediate_observer, filter, stagnation_tracker, symcc_config, feature_extractor)
     }
 }
 
@@ -354,9 +351,11 @@ where
     O3: MapObserver,
 {
     /// Creates a new transforming [`FilterPwerMutationalStage`]
-    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>) -> Result<Self, Error> {
-        let mut out = BufWriter::new(File::create("data.csv")?);
-        writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,valid_signature,width,height,bit_depth,color_type")?;
+    pub fn transforming(mutator: M, dist_observer: &O1, targets_observer: &O2, intermediate_observer: &O3, filter: Box<dyn FilterTrait>, stagnation_tracker: StagnationTracker, symcc_config: Option<SymccConfig>, feature_extractor: Box<dyn FeatureExtractor>) -> Result<Self, Error> {
+        let mut out = BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open("data.csv")?);
+        if out.get_ref().metadata()?.len() == 0 {
+        writeln!(out, "id,iter_id,iter_count,mut_sz,parent_dist,eval_result,mut_dist,target,decision,features")?;
+        }
         
         Ok(Self {
             mutator,
@@ -367,8 +366,68 @@ where
             intermediate_name: intermediate_observer.name().to_string(),
             filter,
             stagnation_tracker,
+            checkpoint_dir: None,
+            checkpoint_at: std::time::Instant::now(),            
             symcc_config,
+            feature_extractor
         })
+    }
+
+    pub fn configure_checkpoint(&mut self, root: std::path::PathBuf, signature: &[u8], resume: bool) -> Result<(), Error> {
+        std::fs::create_dir_all(&root)?;
+        let identity = root.join("identity.bin");
+        
+        if resume && identity.exists() && std::fs::read(&identity)? != signature {
+            return Err(Error::illegal_argument("Checkpoint configuration differs; use a new output directory"));
+        }
+        
+        if resume && root.join("latest").exists() {
+            let generation = std::fs::read_to_string(root.join("latest"))?;
+            let dir = root.join(generation.trim());
+        
+            self.filter.restore(&dir)?;
+            self.stagnation_tracker.restore(&dir.join("symcc.bin"))?;
+            println!("[CHECKPOINT] Restored {}", dir.display());
+        } else {
+            // A fresh corpus must not inherit CorpusIds from an earlier campaign.
+            let _ = std::fs::remove_file(root.join("latest"));
+        }
+        
+        std::fs::write(identity, signature)?;
+        self.checkpoint_dir = Some(root);
+        
+        Ok(())
+    }
+
+    fn save_checkpoint(&mut self) -> Result<(), Error> {
+        let Some(root) = &self.checkpoint_dir else { return Ok(()); };
+        
+        if self.checkpoint_at.elapsed() < std::time::Duration::from_secs(30) { return Ok(()); }
+        
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::illegal_argument(e.to_string()))?.as_nanos();
+        
+        let name = format!("checkpoint-{}-{stamp}", std::process::id());
+        
+        let dir = root.join(&name);
+        
+        std::fs::create_dir(&dir)?;
+        self.filter.checkpoint(&dir)?;
+        self.stagnation_tracker.save(&dir.join("symcc.bin"))?;
+        
+        std::fs::write(root.join("latest.tmp"), &name)?;
+        
+        let old = std::fs::read_to_string(root.join("latest")).ok();
+        std::fs::rename(root.join("latest.tmp"), root.join("latest"))?;
+        
+        if let Some(old) = old {
+            if old.starts_with("checkpoint-") && !old.contains('/') {
+                let _ = std::fs::remove_dir_all(root.join(old.trim()));
+            }
+        }
+        
+        self.checkpoint_at = std::time::Instant::now();
+        Ok(())
     }
 
     pub fn do_observers(&self, executor: &E, reached_intermediates: &mut Vec<usize>, 

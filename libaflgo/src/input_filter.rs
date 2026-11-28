@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 
-use crate::png_features::PngFeatures;
 
 use libafl::{
     corpus::{CorpusId},
@@ -10,14 +9,15 @@ use libafl::{
 
 // id, iter_id, iter_count, mut_sz, parent_dist, eval_result, mut_dist, target
 // Фильтер получает эти признаки до запуска и принимает решение о допуске
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MutantFeatures {
     pub id: CorpusId,
     pub iter_id: u64,
     pub iter_count: u64,
     pub mut_sz: usize,
     pub parent_dist: f64,
-    pub png: PngFeatures
+    // pub png: PngFeatures
+    pub features: Vec<f32>
 }
 
 // Фильтр получает эти признаки после запуска и дообучает модель
@@ -30,7 +30,7 @@ pub struct MutantOutcome {
     pub reached_intermediates: Vec<usize>
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Decision {
     Execute,
     Discard,
@@ -38,6 +38,9 @@ pub enum Decision {
 }
 
 pub trait FilterTrait: Debug {
+    fn checkpoint(&self, _dir: &std::path::Path) -> Result<(), std::io::Error> { Ok(()) }
+    fn restore(&mut self, _dir: &std::path::Path) -> Result<(), std::io::Error> { Ok(()) }
+
     // Принимаем решение о запуске мутанта на основе его признаков
     fn make_decision(&mut self, features: &MutantFeatures) -> Decision;
     

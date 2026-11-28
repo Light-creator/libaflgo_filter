@@ -26,6 +26,7 @@ pub mod input_filter;
 pub mod png_features;
 pub mod ml_filter;
 pub mod symcc;
+pub mod features;
 
 pub trait DistanceObserver<S>: Observer<S>
 where

@@ -682,6 +682,7 @@ dependencies = [
 name = "libaflgo"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "libafl",
  "libc",
  "libloading",

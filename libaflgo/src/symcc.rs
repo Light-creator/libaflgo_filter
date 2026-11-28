@@ -98,7 +98,7 @@ pub enum StagnationState {
     Idle, Running
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SymccCandidate {
     corpus_id: CorpusId,
     distance: f64
@@ -149,13 +149,34 @@ impl StagnationTracker {
         }
     }
 
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let data = bincode::serialize(&(self.best_distance, self.seen_intermediates.to_vec(),
+            self.seen_targets.to_vec(), &self.candidates, &self.seen_candidates, &self.attempted_inputs))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(path, data)
+    }
+
+    pub fn restore(&mut self, path: &Path) -> io::Result<()> {
+        let snapshot: (Option<f64>, Vec<bool>, Vec<bool>, Vec<SymccCandidate>, HashSet<CorpusId>, HashSet<Vec<u8>>) =
+            bincode::deserialize(&fs::read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.best_distance = snapshot.0;
+        self.seen_intermediates = snapshot.1.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid intermediate map"))?;
+        self.seen_targets = snapshot.2.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid target map"))?;
+        self.candidates = snapshot.3;
+        self.seen_candidates = snapshot.4;
+        self.attempted_inputs = snapshot.5;
+        // Restart begins a fresh grace period; downtime is not stagnation.
+        self.last_progress = Instant::now();
+        self.last_trigger = Some(Instant::now());
+        self.state = StagnationState::Idle;
+        Ok(())
+    }
+
     pub fn observe(&mut self, new_corpus_entry: bool, distance: f64, 
         reached_intermediates: &[usize], reached_targets: &[usize]) {
         self.observations += 1;
         if new_corpus_entry {
             self.corpus_progress += 1;
-            self.progress_reason = "corpus entry";
-            self.last_progress = Instant::now();
         }
 
         if distance.is_finite() {
@@ -306,4 +327,27 @@ pub fn read_unique_inputs(directory: &Path) -> io::Result<Vec<Vec<u8>>> {
     }
     println!("[SYMCC] Files: {} | unique inputs: {}", file_count, inputs.len());
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    #[test]
+    fn restores_progress_and_attempt_history() {
+        let path = std::env::temp_dir().join(format!("symcc-state-{}", std::process::id()));
+        let mut before = StagnationTracker::new(Duration::from_secs(60));
+        before.observe(false, 3.5, &[7], &[2]);
+        before.observe_candidate(4_usize.into(), 3.5);
+        assert_eq!(before.best_candidate(), Some(4_usize.into()));
+        assert!(before.register_input(b"already tried"));
+        before.save(&path).unwrap();
+        let mut after = StagnationTracker::new(Duration::from_secs(60));
+        after.restore(&path).unwrap();
+        assert_eq!(after.best_distance, Some(3.5));
+        assert!(after.seen_intermediates[7] && after.seen_targets[2]);
+        assert_eq!(after.best_candidate(), None);
+        assert!(!after.register_input(b"already tried"));
+        assert!(!after.should_trigger());
+        std::fs::remove_file(path).unwrap();
+    }
 }
