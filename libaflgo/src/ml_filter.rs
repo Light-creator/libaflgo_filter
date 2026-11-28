@@ -76,13 +76,13 @@ pub struct MlFilter {
 // } 
 
 impl MlFilter {
-    pub fn new(max_samples: usize, path: &Path, seed: u64, node_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(max_samples: usize, path: &Path, seed: u64, node_path: &Path, mlp_input_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let library = unsafe { libloading::Library::new(path) }?;
-    
+
         let intermediate_chain = Self::read_target_csv(node_path, 0)?;
         println!("intermediate_chain: {:?}", intermediate_chain);
 
-        Ok(Self {
+        let filter = Self {
             samples: Vec::new(),
             max_samples,
             library,
@@ -105,7 +105,26 @@ impl MlFilter {
             target_explore: 0,
             calibrating_probs: Vec::new(),
             calibrating_labels: Vec::new()
-        })
+        };
+
+        let res = filter.mlp_init(mlp_input_size)?;
+        if res != 0 {
+            return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "MLP initialization failed",
+            ).into());
+        }
+
+        Ok(filter)
+    }
+
+    pub fn mlp_init(&self, input_size: usize) -> Result<i32, libloading::Error> {
+        type Init = extern "C" fn(usize) -> i32;
+        let model_init: libloading::Symbol<Init> = unsafe { self.library.get(b"model_init\0") }?;
+
+        let res = model_init(input_size);
+
+        Ok(res)
     }
 
     pub fn predict(&self, features: &MutantFeatures) -> Result<f32, libloading::Error> {

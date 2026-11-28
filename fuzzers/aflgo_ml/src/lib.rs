@@ -57,6 +57,7 @@ use libaflgo::filter::{FilterDistancePowerMutationalStage};
 use libaflgo::png_features::{PngFeatureExtractor};
 use libaflgo::symcc::{StagnationTracker, SymccConfig};
 use libaflgo::ml_filter::MlFilter;
+use libaflgo::features::FeatureExtractor;
 use libaflgo_targets::{distance::InProcessDistanceObserver, target::get_targets_map_observer};
 use libaflgo_targets::intermediate::get_intermediate_map_observer;
 
@@ -382,12 +383,12 @@ fn fuzz<P: AsRef<Path>>(
     
     // TODO change to our realisation
     
-    // let symcc = 
+    let extractor: Box<dyn FeatureExtractor> = Box::new(PngFeatureExtractor); 
     
     let ml_filter: Box<dyn libaflgo::input_filter::FilterTrait> = if enable_mlp {
         let library = ml_library.as_ref().ok_or_else(|| Error::illegal_argument("Missing --ml-library"))?;
         
-        Box::new(MlFilter::new(1000, library, 1337, &intermediate_nodes)
+        Box::new(MlFilter::new(1000, library, 1337, &intermediate_nodes, extractor.get_features_count())
             .map_err(|e| Error::illegal_argument(format!("Failed to initialize ML filter: {e}")))?)
 
     } else { 
@@ -396,7 +397,7 @@ fn fuzz<P: AsRef<Path>>(
 
     let stagnation_tracker = StagnationTracker::new(Duration::from_secs(10));
 
-    let mut power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, ml_filter, stagnation_tracker, symcc_config, Box::new(PngFeatureExtractor))?;
+    let mut power = FilterDistancePowerMutationalStage::new(mutator, &distance_observer, &targets_observer, &intermediate_observer, ml_filter, stagnation_tracker, symcc_config, extractor)?;
 
     if enable_checkpoint {
         use std::hash::{Hash, Hasher};
